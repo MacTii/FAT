@@ -1,146 +1,78 @@
-#ifndef FAT_FILE_READER_H
-#define FAT_FILE_READER_H
+#ifndef FILE_READER_H
+#define FILE_READER_H
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdbool.h>
-#include <ctype.h>
 
-#include <errno.h>
-#include <string.h>
+#define SECTOR_SIZE 512
 
+#define FILENAME_SIZE_ROOT 8
+#define EXTENSION_SIZE_ROOT 3
 
-#define SECTOR_SIZE 0x200
-#define SECTOR_SIZE_FAT12 512
-#define SECTOR_END_MARKER_VALUE 0xAA55
-#define SIGNATURE_VALUE 0x29
-#define SIGNATURE_VALUE_FAT12 0x28
-#define SECTOR_END_MARKER_VALUE_FAT12 0xAA55
-
-#define MAX_ENTRIES_AMOUNT 512
-#define FILENAME_LEN 8
-#define EXTENSION_LEN 3
-#define FULL_FILENAME_LEN (FILENAME_LEN + EXTENSION_LEN + 1)
-
-#define DELETED 0xE5
-
-#define EOC_MARKER_LOW_BOUNDARY 0xFFF8
-
-#define SEEK_SET 0
-#define SEEK_CUR 1
-#define SEEK_END 2\
+#define ERROR_MAGIC 0x01u
+#define ERROR_RESERVED_SECTORS 0x02u
+#define ERROR_FAT_COUNT 0x04u
+#define ERROR_BYTES_PER_SECTOR 0x08u
+#define ERROR_LOGICAL_SECTORS 0x10u
+#define ERROR_SECTORS_PER_FAT 0x20u
+#define ERROR_LOGICAL_SECTORS_VALUE 0x40u
+#define ERROR_SECTORS_PER_CLUSTER 0x80u
 
 typedef uint32_t lba_t;
 typedef uint32_t cluster_t;
 
-typedef enum {READ_ONLY = 0x01, HIDDEN_FILE = 0x02, SYSTEM_FILE = 0x04,
+typedef uint16_t fat_date_t;
+typedef uint16_t fat_time_t;
+
+typedef enum {
+    READ_ONLY = 0x01, HIDDEN_FILE = 0x02, SYSTEM_FILE = 0x04,
     VOLUME_LABEL = 0x08, LONG_FILE_NAME = 0x0f, DIRECTORY = 0x10,
-    ARCHIVE = 0x20, LFN = READ_ONLY | HIDDEN_FILE | SYSTEM_FILE | VOLUME_LABEL} __attribute__((packed))
-        dir_attributes;
+    ARCHIVE = 0x20, LFN = READ_ONLY | HIDDEN_FILE | SYSTEM_FILE | VOLUME_LABEL
+} __attribute__((packed)) dir_attributes;
 
-
-typedef struct VBR_t {
-    uint8_t jump_instructions[3];
-    uint8_t OEM[8];
-
-    struct {
-        uint16_t bytes_per_sector;
-        uint8_t sectors_per_cluster;
-        uint16_t reserved_sectors;
-        uint8_t FATs;
-        uint16_t root_entries;
-        uint16_t small_sectors;
-        uint8_t media_type;
-        uint16_t sectors_per_FAT;
-        uint16_t sectors_per_track;
-        uint16_t head_sides_num;
-        uint32_t hidden_sectors;
-        uint32_t large_sectors;
-        uint8_t drive_number;
-        uint8_t : 8;
-        uint8_t signature;
-        uint32_t serial_number;
-    } __attribute__((packed));
-
-    struct {
-        uint8_t label[11];
-        uint8_t system_type_level[8];
-    } __attribute__((packed));
-
+struct fat_super_t {
+    uint8_t jump_code[3];
+    char oem_name[8];
+    uint16_t bytes_per_sector;
+    uint8_t sectors_per_cluster;
+    uint16_t reserved_sectors;
+    uint8_t fat_count;
+    uint16_t root_dir_capacity;
+    uint16_t logical_sectors16;
+    uint8_t media_type;
+    uint16_t sectors_per_fat;
+    uint16_t chs_sectors_per_track;
+    uint16_t chs_tracks_per_cylinder;
+    uint32_t hidden_sectors;
+    uint32_t logical_sectors32;
+    uint8_t media_id;
+    uint8_t chs_head;
+    uint8_t ext_bpb_signature;
+    uint32_t serial_number;
+    char volume_label[11];
+    char fsid[8];
     uint8_t boot_code[448];
-    uint16_t sector_end_marker;
-} __attribute__((packed)) VBR_t;
+    uint16_t magic;
+} __attribute__ ((packed)) fat_super_t;
 
-
-typedef struct file_entry_t {
-    union {
-        struct {
-            uint8_t filename[FILENAME_LEN];
-            uint8_t extension[EXTENSION_LEN];
-        };
-        uint8_t allocation_status;
-    };
-
-    dir_attributes attributes;
-    uint8_t reserved;
-
-    struct creation_time {
-        uint8_t seconds_tens;
-        uint16_t hh_mm_ss;
-        uint16_t yy_mm_dd;
-    } __attribute__((packed)) creation_time;
-
-    uint16_t access_date;
-    uint16_t first_cluster_address_high_order;
-
-    struct modify_time {
-        uint16_t hh_mm_ss;
-        uint16_t yy_mm_dd;
-    } __attribute__((packed)) modify_time;
-
-    uint16_t first_cluster_address_low_order;
+struct root_entry_t {
+    char file_name[FILENAME_SIZE_ROOT + EXTENSION_SIZE_ROOT];
+    dir_attributes file_attributes;
+    uint8_t reserved0;
+    uint8_t cration_time_ms;
+    fat_time_t creation_time;
+    fat_date_t creation_date;
+    fat_time_t last_accessed_time;
+    uint16_t high_cluster_index;
+    fat_time_t last_modified_time;
+    fat_date_t last_modified_date;
+    uint16_t low_cluster_index;
     uint32_t file_size;
-} __attribute__((packed)) Entry_t;
-
-
-struct disk_t {
-    VBR_t *VBR;
-    FILE *disk_file;
-};
-
-struct dir_t {
-    Entry_t *entry;
-    size_t amount;
-    size_t current_dir_entry;
-};
-
-
-struct volume_t {
-    uint8_t **FATs_handler;
-    struct disk_t *disk;
-    lba_t volume_start;
-    lba_t user_data_pos;
-    uint16_t *FAT_mem;
-    Entry_t *root_dir_entries;
-    uint16_t entries_amount;
-    uint32_t eoc_marker;
-    struct dir_t root_dir;
-};
-
-
-struct file_t {
-    Entry_t *entry;
-    size_t offset;
-    size_t size;
-    bool is_open;
-    cluster_t start_of_chain;
-    struct volume_t *in_volume;
-};
-
+} __attribute__ ((packed)) root_entry_t;
 
 struct dir_entry_t {
-    char name[14];
+    char *name;
     size_t size;
     bool is_archived;
     bool is_readonly;
@@ -149,20 +81,69 @@ struct dir_entry_t {
     bool is_directory;
 };
 
-struct disk_t* disk_open_from_file(const char* volume_file_name);
-int disk_read(struct disk_t* pdisk, int32_t first_sector, void* buffer, int32_t sectors_to_read);
-int disk_close(struct disk_t* pdisk);
+struct volume_t {
+    struct disk_t *disk;
+    struct fat_super_t fat_super;
 
-struct volume_t* fat_open(struct disk_t* pdisk, uint32_t first_sector);
-int fat_close(struct volume_t* pvolume);
+    lba_t start_pos;
+    lba_t fat1_start;
+    lba_t fat2_start;
+    lba_t root_dir_start;
+    lba_t root_dir_size;
+    lba_t cluster2_start;
 
-struct file_t* file_open(struct volume_t* pvolume, const char* file_name);
-int file_close(struct file_t* stream);
+    lba_t user_space_size;
+    lba_t volume_size;
+    cluster_t total_clusters;
+    size_t bytes_per_sector;
+
+    uint32_t *fat_table;
+    struct root_entry_t *root_dir;
+} volume_t;
+
+struct file_t {
+    struct volume_t *volume;
+    struct root_entry_t *entry;
+
+    cluster_t first_cluster_index;
+    size_t size_of_file_bytes;
+
+    lba_t current_sector_offset;
+    size_t current_bytes_offset;
+} file_t;
+
+struct dir_t {
+    struct volume_t *volume;
+    struct root_entry_t *entry;
+    size_t size;
+} dir_t;
+
+struct disk_t {
+    FILE *disk_file;
+} disk_t;
+
+struct disk_t *disk_open_from_file(const char *volume_file_name);
+
+int disk_read(struct disk_t *pdisk, int32_t first_sector, void *buffer, int32_t sectors_to_read);
+
+int disk_close(struct disk_t *pdisk);
+
+struct volume_t *fat_open(struct disk_t *pdisk, uint32_t first_sector);
+
+int fat_close(struct volume_t *pvolume);
+
+struct file_t *file_open(struct volume_t *pvolume, const char *file_name);
+
+int file_close(struct file_t *stream);
+
 size_t file_read(void *ptr, size_t size, size_t nmemb, struct file_t *stream);
-int32_t file_seek(struct file_t* stream, int32_t offset, int whence);
 
-struct dir_t* dir_open(struct volume_t* pvolume, const char* dir_path);
-int dir_read(struct dir_t* pdir, struct dir_entry_t* pentry);
-int dir_close(struct dir_t* pdir);
+int32_t file_seek(struct file_t *stream, int32_t offset, int whence);
 
-#endif //FAT_FILE_READER_H
+struct dir_t *dir_open(struct volume_t *pvolume, const char *dir_path);
+
+int dir_read(struct dir_t *pdir, struct dir_entry_t *pentry);
+
+int dir_close(struct dir_t *pdir);
+
+#endif

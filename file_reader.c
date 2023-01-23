@@ -1,573 +1,608 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
 #include "file_reader.h"
+#include "utils.h"
+#include "tested_declarations.h"
+#include "rdebug.h"
+
+#define FAT_DELETED_MAGIC ((char)0xE5)
 
 struct disk_t *disk_open_from_file(const char *volume_file_name) {
-
-    if (!volume_file_name) {
-        errno = EFAULT;
+    if (!volume_file_name)
         return NULL;
-    }
 
     struct disk_t *disk = (struct disk_t *) calloc(sizeof(struct disk_t), 1);
-    if (!disk) {
-        errno = ENOMEM;
+    if (!disk)
         return NULL;
-    }
-
-    disk->VBR = (struct VBR_t *) calloc(1, sizeof(struct VBR_t));
-    if (!disk->VBR) {
-        free(disk);
-        disk = NULL;
-        errno = ENOMEM;
-        return NULL;
-    }
 
     disk->disk_file = fopen(volume_file_name, "rb");
-    if (!disk->disk_file) {
-        free(disk->VBR);
-        disk->VBR = NULL;
-        free(disk);
-        disk = NULL;
-        errno = ENOENT;
-        return NULL;
-    }
-
-    if (disk_read(disk, 0, disk->VBR, 1) == -1) {
-        free(disk->VBR);
-        disk->VBR = NULL;
-        fclose(disk->disk_file);
-        free(disk);
-        disk = NULL;
-        return NULL;
-    }
+    if (!disk->disk_file)
+        return free(disk), NULL;
 
     return disk;
 }
 
+int disk_read(struct disk_t *pdisk, int32_t first_sector, void *buffer, int32_t sectors_to_read) {
 
-int disk_read(struct disk_t *from, int32_t first_sector, void *to, int32_t sectors_to_read) {
-
-    if (!from || !to) {
-        errno = EFAULT;
+    if (!pdisk || !buffer || first_sector < 0 || sectors_to_read < 0)
         return -1;
-    }
 
-    if (first_sector < 0 || sectors_to_read < 0) {
-        errno = ERANGE;
+    fseek(pdisk->disk_file, first_sector * SECTOR_SIZE, SEEK_SET);
+
+    int32_t read_blocks = (int32_t) fread(buffer, SECTOR_SIZE, sectors_to_read, pdisk->disk_file);
+    if (read_blocks != sectors_to_read)
         return -1;
-    }
-
-    fseek(from->disk_file, first_sector * SECTOR_SIZE_FAT12, SEEK_SET);
-
-    int32_t read_blocks = (int32_t) fread(to, SECTOR_SIZE_FAT12, sectors_to_read, from->disk_file);
-    if (read_blocks != sectors_to_read) {
-        errno = ERANGE;
-        return -1;
-    }
 
     return read_blocks;
 }
 
-
 int disk_close(struct disk_t *pdisk) {
-    if (!pdisk || !pdisk->disk_file || !pdisk->VBR) {
-        errno = EFAULT;
+    if (!pdisk || !pdisk->disk_file)
         return -1;
-    }
 
     fclose(pdisk->disk_file);
-    free(pdisk->VBR);
-    pdisk->VBR = NULL;
     free(pdisk);
-    pdisk = NULL;
+
     return 0;
 }
 
-
-static bool is_VBR_valid(const VBR_t *const VBR) {
-    if (VBR->reserved_sectors == 0) return false;
-    if (VBR->bytes_per_sector == 0 || ((VBR->root_entries * sizeof(Entry_t)) % VBR->bytes_per_sector) != 0)
-        return false;
-    if (VBR->sectors_per_FAT < 1) return false;
-    if (VBR->signature != SIGNATURE_VALUE) return false;
-    if (!(VBR->small_sectors == 0 ^ VBR->large_sectors == 0)) return false;
-    if (VBR->small_sectors == 0 && VBR->large_sectors < 65536) return false;
-
-
-    uint8_t _counter = 0;
-    const uint8_t _aval_sectors_per_cluster[] = {1, 2, 4, 8, 16, 32, 64, 128};
-    const uint8_t _length = sizeof(_aval_sectors_per_cluster) / sizeof(*_aval_sectors_per_cluster);
-    for (; _counter < _length; _counter++) {
-        if (VBR->sectors_per_cluster == _aval_sectors_per_cluster[_counter]) break;
-    }
-    if (_counter == _length) return false;
-
-    return VBR->sector_end_marker == SECTOR_END_MARKER_VALUE;
-}
-
-bool allocate_memory_for_FATs(struct volume_t *const volume, const lba_t FAT_memory_size) {
-    for (int i = 0; i < volume->disk->VBR->FATs; i++) {
-        volume->FATs_handler[i] = (uint8_t *) calloc(1, FAT_memory_size);
-        if (!volume->FATs_handler[i]) {
-            for (int j = 0; j < i; j++) {
-                free(volume->FATs_handler[i]);
-                volume->FATs_handler[i] = NULL;
-            }
-            free(volume->FATs_handler);
-            volume->FATs_handler = NULL;
-            errno = ENOMEM;
-            return false;
-        }
-    }
-    return true;
-}
-
-bool load_data_into_FATs(struct volume_t *const volume) {
-    for (int i = 0; i < volume->disk->VBR->FATs; i++) {
-
-        const lba_t fat_position =
-                volume->volume_start + volume->disk->VBR->reserved_sectors + volume->disk->VBR->sectors_per_FAT * i;
-        const int32_t sectors_read = disk_read(volume->disk, fat_position, volume->FATs_handler[i],
-                                               volume->disk->VBR->sectors_per_FAT);
-
-        if (sectors_read != volume->disk->VBR->sectors_per_FAT) {
-            errno = ERANGE;
-            for (int j = 0; j < volume->disk->VBR->FATs; j++) {
-                free(volume->FATs_handler[j]);
-                volume->FATs_handler[j] = NULL;
-            }
-            free(volume->FATs_handler);
-            volume->FATs_handler = NULL;
-            return false;
-        }
-    }
-    return true;
-}
-
-bool validate_FATs(struct volume_t *const volume, const lba_t FAT_memory_size) {
-    for (int i = 1; i < volume->disk->VBR->FATs; i++) {
-        if (memcmp(volume->FATs_handler[i - 1], volume->FATs_handler[i], FAT_memory_size) != 0) {
-            errno = EINVAL;
-            for (int j = 0; j < volume->disk->VBR->FATs; j++) {
-                free(volume->FATs_handler[j]);
-                volume->FATs_handler[j] = NULL;
-            }
-            free(volume->FATs_handler);
-            volume->FATs_handler = NULL;
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool load_FATs(struct volume_t *const volume) {
-
-    //Allocate memory for FATs ptr
-    volume->FATs_handler = (uint8_t **) calloc(volume->disk->VBR->FATs, sizeof(uint8_t *));
-    if (!volume->FATs_handler) {
-        errno = ENOMEM;
-        return false;
-    }
-
-    const lba_t FAT_memory_size = volume->disk->VBR->sectors_per_FAT * volume->disk->VBR->bytes_per_sector;
-
-    //Allocate memory for FATs
-    allocate_memory_for_FATs(volume, FAT_memory_size);
-
-    //Load data into FATs
-    load_data_into_FATs(volume);
-
-    //Validate FATs
-    validate_FATs(volume, FAT_memory_size);
-
-    volume->FAT_mem = (uint16_t *) volume->FATs_handler[0];
-    for (int i = 1; i < volume->disk->VBR->FATs; i++) {
-        free(volume->FATs_handler[i]);
-        volume->FATs_handler[i] = NULL;
-    }
-    free(volume->FATs_handler);
-
-    uint32_t eoc_marker = (volume->FAT_mem[1] << 16) | volume->FAT_mem[2];
-    volume->eoc_marker = eoc_marker;
-
-    if (volume->eoc_marker < EOC_MARKER_LOW_BOUNDARY) {
-        errno = EINVAL;
-        return false;
-    }
-    return true;
-}
-
-
-static bool load_root_dir(struct volume_t *const volume) {
-    const lba_t root_dir_pos = volume->volume_start + volume->disk->VBR->reserved_sectors +
-                               volume->disk->VBR->FATs * volume->disk->VBR->sectors_per_FAT;
-
-    lba_t root_dir_size = (volume->disk->VBR->root_entries * sizeof(Entry_t)) / volume->disk->VBR->bytes_per_sector;
-    root_dir_size += ((volume->disk->VBR->root_entries * sizeof(Entry_t)) % volume->disk->VBR->bytes_per_sector) != 0;
-
-    const size_t root_dir_bytes = root_dir_size * volume->disk->VBR->bytes_per_sector;
-
-    volume->root_dir_entries = (Entry_t *) calloc(1, root_dir_bytes);
-    if (!volume->root_dir_entries) {
-        errno = ENOMEM;
-        return false;
-    }
-
-    const int32_t read_blocks = disk_read(volume->disk, root_dir_pos, volume->root_dir_entries, root_dir_size);
-    if (read_blocks != (int64_t) root_dir_size) {
-        free(volume->root_dir_entries);
-        volume->root_dir_entries = NULL;
-        return false;
-    }
-
-    return true;
-}
-
-
-/* Boot Sector | FAT1 | FAT2 | FAT... | ROOT DIRECTORY | DATA REGION */
 struct volume_t *fat_open(struct disk_t *pdisk, uint32_t first_sector) {
-    if (!pdisk) {
-        errno = EFAULT;
+    if (!pdisk || !pdisk->disk_file)
         return NULL;
-    }
 
-    if (!is_VBR_valid(pdisk->VBR)) {
-        errno = EINVAL;
+    struct volume_t *pVolume = (struct volume_t *) calloc(1, sizeof(struct volume_t));
+    if (!pVolume)
         return NULL;
-    }
 
-    struct volume_t *volume = (struct volume_t *) calloc(1, sizeof(struct volume_t));
-    if (!volume) {
-        errno = ENOMEM;
-        return NULL;
-    }
+    if (disk_read(pdisk, first_sector, &pVolume->fat_super, 1) != 1)
+        return fat_close(pVolume), NULL;
 
-    volume->disk = pdisk;
-    volume->volume_start = first_sector;
+    if (check_fat_super(pVolume->fat_super))
+        return fat_close(pVolume), NULL;
 
-    if (!load_FATs(volume)) { // COS NIE TAK
-        free(volume);
-        volume = NULL;
-        return NULL;
-    }
+    if (set_volume_geometry(pVolume, first_sector))
+        return fat_close(pVolume), NULL;
 
-    if (!load_root_dir(volume)) {
-        free(volume);
-        volume = NULL;
-        return NULL;
-    }
+    pVolume->disk = pdisk;
 
-    const lba_t root_dir_pos = volume->volume_start + volume->disk->VBR->reserved_sectors +
-                               volume->disk->VBR->FATs * volume->disk->VBR->sectors_per_FAT;
-    lba_t root_dir_size = (volume->disk->VBR->root_entries * sizeof(Entry_t)) / volume->disk->VBR->bytes_per_sector;
-    root_dir_size += ((volume->disk->VBR->root_entries * sizeof(Entry_t)) % volume->disk->VBR->bytes_per_sector) != 0;
+    if (pVolume->fat_super.fat_count == 2)
+        if (compare_fat_tables(pVolume))
+            return fat_close(pVolume), NULL;
 
-    volume->user_data_pos = root_dir_pos + root_dir_size;
-    volume->entries_amount = 0;
+    pVolume->fat_table = load_fat_table(pVolume);
+    if (!pVolume->fat_table)
+        return fat_close(pVolume), NULL;
 
-    for (int i = 0; i < MAX_ENTRIES_AMOUNT; i++) {
-        if ((*(volume->root_dir_entries + i)).filename[0] == '\x0') {
-            volume->entries_amount = i;
-            break;
-        }
-    }
-    volume->entries_amount = !volume->entries_amount ? MAX_ENTRIES_AMOUNT : volume->entries_amount;
+    pVolume->root_dir = (struct root_entry_t *) calloc(pVolume->root_dir_size, pVolume->bytes_per_sector);
+    if (!pVolume->root_dir)
+        return fat_close(pVolume), NULL;
 
-    return volume;
+    if (disk_read(pVolume->disk, pVolume->root_dir_start, pVolume->root_dir, pVolume->root_dir_size) !=
+        (int) pVolume->root_dir_size)
+        return fat_close(pVolume), NULL;
+
+    return pVolume;
 }
-
 
 int fat_close(struct volume_t *pvolume) {
-    if (!pvolume || !pvolume->FAT_mem || !pvolume->root_dir_entries || !pvolume->disk) {
-        errno = EFAULT;
+    if (!pvolume)
         return -1;
-    }
 
-    free(pvolume->FAT_mem);
-    pvolume->FAT_mem = NULL;
-
-    free(pvolume->root_dir_entries);
-    pvolume->root_dir_entries = NULL;
+    free(pvolume->fat_table);
+    free(pvolume->root_dir);
     free(pvolume);
-    pvolume = NULL;
+
     return 0;
 }
 
-
-static bool is_dir(const Entry_t *const entry) {
-    return (entry->file_size == 0 && (entry->attributes & DIRECTORY));
-}
-
-
-static void parse_filename(Entry_t const *const entry, char *to) {
-    char filename[FILENAME_LEN + 1] = {0};
-    memcpy(filename, entry->filename, FILENAME_LEN);
-
-    if (!is_dir(entry)) {
-        char extension[EXTENSION_LEN + 1] = {0};
-        memcpy(extension, entry->extension, EXTENSION_LEN);
-        if (toupper(*entry->extension) >= 'A' && toupper(*entry->extension <= 'Z')) {
-            sprintf(to, "%s.%s", strtok(filename, " "), strtok(extension, " "));
-        } else {
-            sprintf(to, "%s", strtok(filename, " "));
-        }
-    } else {
-        sprintf(to, "%s", strtok(filename, " "));
-    }
-}
-
-
-static int find_file(const struct volume_t *const pvolume, const char *const file_name) {
-
-    char buffer[FULL_FILENAME_LEN + 1] = {0};
-
-    for (int i = 0; i < pvolume->entries_amount; i++) {
-        if ((pvolume->root_dir_entries[i].attributes & VOLUME_LABEL) ||
-            (pvolume->root_dir_entries[i].filename[0] == DELETED)) {
-            continue;
-        }
-
-        parse_filename(pvolume->root_dir_entries + i, buffer);
-        if (strcmp(buffer, file_name) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-
 struct file_t *file_open(struct volume_t *pvolume, const char *file_name) {
-
-    if (!pvolume || !pvolume->disk || !pvolume->FAT_mem || !file_name) {
-        errno = EFAULT;
+    if (!pvolume || !file_name || !pvolume->disk)
         return NULL;
-    }
 
-
-    int file_index = find_file(pvolume, file_name);
-    if (-1 == file_index) {
-        errno = ENOENT;
+    struct file_t *file = calloc(sizeof(struct file_t), 1);
+    if (!file)
         return NULL;
-    }
 
-    if (is_dir(pvolume->root_dir_entries + file_index)) {
-        errno = EISDIR;
-        return NULL;
-    }
+    file->volume = pvolume;
 
-    struct file_t *file = (struct file_t *) calloc(sizeof(struct file_t), 1);
-    if (!file) {
-        errno = ENOMEM;
-        return NULL;
-    }
+    file->entry = find_entry_in_root_dir(file->volume, file_name);
+    if (!file->entry || (file->entry->file_attributes & (DIRECTORY | VOLUME_LABEL)) != 0)
+        return file_close(file), NULL;
 
-    file->entry = pvolume->root_dir_entries + file_index;
-    file->offset = 0;
-    file->is_open = true;
-    file->size = pvolume->root_dir_entries[file_index].file_size;
-    file->start_of_chain = ((cluster_t) pvolume->root_dir_entries[file_index].first_cluster_address_high_order << 16) |
-                           pvolume->root_dir_entries[file_index].first_cluster_address_low_order;
-    file->in_volume = pvolume;
+    file->current_bytes_offset = 0;
+    file->current_sector_offset = 0;
+
+    file->first_cluster_index = ((cluster_t) file->entry->high_cluster_index << 16) | file->entry->low_cluster_index;
+
+    file->size_of_file_bytes = file->entry->file_size;
+
     return file;
 }
 
-
 int file_close(struct file_t *stream) {
-    if (!stream) {
-        errno = EFAULT;
+    if (!stream)
         return -1;
-    }
-    stream->is_open = false;
+
     free(stream);
-    stream = NULL;
+
     return 0;
 }
 
-static cluster_t get_next_cluster(const cluster_t after_cluster, const struct volume_t *const from) {
-    if (!from->FAT_mem) return -1;
-    if (after_cluster >= EOC_MARKER_LOW_BOUNDARY) return after_cluster;
-    return from->FAT_mem[after_cluster];
+lba_t get_sectors_per_cluster(struct file_t *stream) {
+    return stream->volume->fat_super.sectors_per_cluster;
 }
 
+cluster_t get_current_cluster_offset(struct file_t* stream) {
+    return stream->current_sector_offset / get_sectors_per_cluster(stream);
+}
 
-static cluster_t get_physical_address(cluster_t cluster, const struct volume_t *const volume) {
-    return volume->user_data_pos + (cluster - 2) * volume->disk->VBR->sectors_per_cluster;
+cluster_t get_cluster_index(struct file_t *stream) {
+    return stream->first_cluster_index;
+}
+
+cluster_t get_current_cluster(struct file_t *stream, cluster_t current_cluster_offset) {
+    cluster_t cluster = get_cluster_index(stream);
+
+    for (cluster_t i = 0; i < current_cluster_offset; ++i)
+    {
+        if (cluster >= stream->volume->fat_table[1])
+            break;
+
+        if (cluster > stream->volume->total_clusters)
+            return cluster;
+
+        cluster = stream->volume->fat_table[cluster];
+    }
+
+    return cluster;
+}
+
+lba_t get_cluster_start(struct file_t *stream) {
+    lba_t sectors_per_cluster = get_sectors_per_cluster(stream);
+    cluster_t current_cluster_offset = get_current_cluster_offset(stream);
+    lba_t current_cluster = get_current_cluster(stream, current_cluster_offset);
+
+    return stream->volume->cluster2_start + (current_cluster - 2) * sectors_per_cluster;
+}
+
+struct file_t* check_current_bytes_offset(struct file_t *stream, size_t bytes_to_read) {
+    stream->current_bytes_offset += bytes_to_read;
+    if (stream->current_bytes_offset >= 512) {
+        stream->current_bytes_offset = 0;
+        stream->current_sector_offset++;
+    }
+    return stream;
+}
+
+size_t get_block_buffer_offset(struct file_t *stream) {
+    return stream->current_bytes_offset % 512;
+}
+
+size_t check_bytes_to_read(struct file_t *stream, size_t bytes_to_read, size_t remaining_bytes_to_read) {
+    size_t block_buffer_offset = get_block_buffer_offset(stream);
+
+    if (remaining_bytes_to_read < 512)
+        bytes_to_read = remaining_bytes_to_read;
+    else
+        bytes_to_read = 512 - block_buffer_offset;
+
+    if (stream->current_bytes_offset + (stream->current_sector_offset * stream->volume->bytes_per_sector) +
+        bytes_to_read > stream->size_of_file_bytes)
+        bytes_to_read = stream->size_of_file_bytes - (stream->current_bytes_offset +
+                                                      (stream->current_sector_offset *
+                                                       stream->volume->bytes_per_sector));
+    else if (block_buffer_offset + bytes_to_read > 512)
+        bytes_to_read = bytes_to_read - ((block_buffer_offset + bytes_to_read) % 512);
+
+    return bytes_to_read;
+}
+
+bool check_input_args(void *ptr, struct file_t *stream) {
+    if (!ptr || !stream)
+        return false;
+    return true;
+}
+
+bool check_end_of_file(struct file_t *stream) {
+    if (stream->current_bytes_offset + stream->current_sector_offset * stream->volume->bytes_per_sector == stream->size_of_file_bytes)
+        return true;
+    return false;
 }
 
 size_t file_read(void *ptr, size_t size, size_t nmemb, struct file_t *stream) {
-
-    if (!ptr || !stream) {
-        errno = EFAULT;
+    if (!check_input_args(ptr, stream))
         return -1;
-    }
 
-    lba_t current_cluster = stream->start_of_chain;
-    lba_t current_cluster_physical = get_physical_address(current_cluster, stream->in_volume);
+    uint8_t block_buffer[512];
+    lba_t sectors_per_cluster = get_sectors_per_cluster(stream);
+    cluster_t current_cluster_offset = get_current_cluster_offset(stream);
+    lba_t current_cluster = get_current_cluster(stream, current_cluster_offset);
 
-    lba_t sector_offset = stream->offset / stream->in_volume->disk->VBR->bytes_per_sector;
-    cluster_t cluster_offset = sector_offset / stream->in_volume->disk->VBR->sectors_per_cluster;
-    sector_offset %= stream->in_volume->disk->VBR->sectors_per_cluster;
+    size_t bytes_loaded = 0;
+    size_t remaining_bytes_to_read = size * nmemb;
 
-    lba_t byte_offset = stream->offset % stream->in_volume->disk->VBR->bytes_per_sector;
+    size_t bytes_to_read;
+    lba_t cluster_start;
 
-    long remain_to_read =
-            size * nmemb > stream->size - stream->offset ? (long) (stream->size - stream->offset) : (long) (size *
-                                                                                                            nmemb);
-    long read_bytes = 0, length;
-    char sector_data[SECTOR_SIZE + 1] = {0};
+    while (remaining_bytes_to_read > 0 &&
+           stream->current_bytes_offset + stream->current_sector_offset * stream->volume->bytes_per_sector !=
+           stream->size_of_file_bytes) {
+        if (current_cluster == stream->volume->fat_table[1])
+            break;
 
-    while (cluster_offset-- != 0) {
-        current_cluster = get_next_cluster(current_cluster, stream->in_volume);
-        current_cluster_physical = get_physical_address(current_cluster, stream->in_volume);
-    }
-
-    while (true) {
-        if (stream->size == stream->offset) return 0;
-
-        int read_blocks = disk_read(stream->in_volume->disk, current_cluster_physical + sector_offset, sector_data, 1);
-        if (read_blocks != 1) {
-            errno = ERANGE;
+        if ((current_cluster) > stream->volume->total_clusters)
             return -1;
+
+        cluster_start = get_cluster_start(stream);
+
+        for (lba_t i = stream->current_sector_offset % sectors_per_cluster; i < sectors_per_cluster; ++i) {
+            if (disk_read(stream->volume->disk, cluster_start + i, block_buffer, 1) != 1)
+                return -1;
+
+            size_t block_buffer_offset = get_block_buffer_offset(stream);
+
+            bytes_to_read = check_bytes_to_read(stream, bytes_to_read, remaining_bytes_to_read);
+
+            memcpy((uint8_t *) ptr + bytes_loaded, block_buffer + block_buffer_offset, bytes_to_read);
+
+            bytes_loaded += bytes_to_read;
+            remaining_bytes_to_read -= bytes_to_read;
+
+            stream = check_current_bytes_offset(stream, bytes_to_read);
+
+            if (check_end_of_file(stream))
+                break;
         }
 
-        bool new_sector = false;
-        if (remain_to_read > SECTOR_SIZE) {
-            length = SECTOR_SIZE;
-            remain_to_read -= length;
-            stream->offset += length;
-            memcpy((void *) ((uint8_t *) ptr + read_bytes), sector_data + byte_offset, length);
-            sector_offset++;
-            read_bytes += length;
-        } else {
-            int pos_in_sector = (int) stream->offset % SECTOR_SIZE;
-            if (remain_to_read > (SECTOR_SIZE - pos_in_sector)) {
-                length = SECTOR_SIZE - pos_in_sector;
-                remain_to_read -= length;
-                sector_offset++;
-                new_sector = true;
-            } else {
-                length = remain_to_read;
-                remain_to_read = 0;
-            }
-            stream->offset += length;
-            memcpy((void *) ((uint8_t *) ptr + read_bytes), sector_data + byte_offset, length);
-            read_bytes += length;
-        }
-
-        if (new_sector) byte_offset = 0;
-        if (remain_to_read > 0) {
-            if (sector_offset >= stream->in_volume->disk->VBR->sectors_per_cluster) {
-                current_cluster = get_next_cluster(current_cluster, stream->in_volume);
-                current_cluster_physical = get_physical_address(current_cluster, stream->in_volume);
-                sector_offset = 0;
-            }
-            continue;
-        }
-
-        return read_bytes / size;
+        current_cluster = stream->volume->fat_table[current_cluster];
+        current_cluster_offset++;
     }
+
+    return bytes_loaded / size;
 }
 
-
-int32_t file_seek(struct file_t *stream, int32_t offset, int whence) {
-
-    if (!stream) {
-        errno = EFAULT;
+ssize_t calculate_offset(struct file_t *stream, int32_t offset, int whence) {
+    if (!stream)
         return -1;
-    }
 
-    bool upper_bound_exceeded = false;
-    bool lower_bound_exceeded = false;
+    ssize_t current_offset;
 
     switch (whence) {
         case SEEK_SET:
-            upper_bound_exceeded = offset > (int) stream->size;
-            lower_bound_exceeded = offset < 0;
+            current_offset = 0;
             break;
         case SEEK_CUR:
-            upper_bound_exceeded = offset + (int) stream->offset > (int) stream->size;
-            lower_bound_exceeded = offset + (int) stream->offset < 0;
+            current_offset =
+                    stream->current_bytes_offset + (stream->current_sector_offset * stream->volume->bytes_per_sector);
             break;
         case SEEK_END:
-            upper_bound_exceeded = offset > 0;
-            lower_bound_exceeded = abs(offset) > (int) stream->size;
+            current_offset = stream->size_of_file_bytes;
             break;
+
         default:
-            errno = EINVAL;
             return -1;
     }
 
-    if (upper_bound_exceeded || lower_bound_exceeded) {
-        errno = ENXIO;
+    current_offset += offset;
+    return current_offset;
+}
+
+int32_t file_seek(struct file_t *stream, int32_t offset, int whence) {
+    if (!stream)
         return -1;
-    }
 
-    if (whence == SEEK_SET) {
-        stream->offset = offset;
-    } else if (whence == SEEK_CUR) {
-        stream->offset += offset;
-    } else {
-        stream->offset = stream->size + offset;
-    }
+    ssize_t current_offset = calculate_offset(stream, offset, whence);
 
-    return stream->offset;
+    if (current_offset < 0 || current_offset > (ssize_t) stream->size_of_file_bytes)
+        return -1;
+
+    stream->current_sector_offset = current_offset / stream->volume->bytes_per_sector;
+    stream->current_bytes_offset = current_offset % stream->volume->bytes_per_sector;
+
+    return current_offset;
 }
-
-
-static struct dir_t *open_root_dir(struct volume_t *pvolume) {
-    pvolume->root_dir.entry = pvolume->root_dir_entries;
-    pvolume->root_dir.amount = pvolume->entries_amount;
-    pvolume->root_dir.current_dir_entry = 0;
-    return &pvolume->root_dir;
-}
-
 
 struct dir_t *dir_open(struct volume_t *pvolume, const char *dir_path) {
-
-    if (!pvolume || !pvolume->disk || !pvolume->FAT_mem || !dir_path) {
-        errno = EFAULT;
+    if (!pvolume)
         return NULL;
-    }
 
-    if (dir_path[0] == '\\' || dir_path[0] == '/') {
-        return open_root_dir(pvolume);
-    }
+    struct dir_t *dir = (struct dir_t *) calloc(1, sizeof(struct dir_t));
+    if (!dir)
+        return NULL;
 
-    return NULL;
+    dir->entry = pvolume->root_dir;
+    dir->volume = pvolume;
+
+    if (strcmp(dir_path, "\\") != 0)
+        return free(dir), NULL;
+
+    dir->size = 0;
+
+    return dir;
 }
-
 
 int dir_read(struct dir_t *pdir, struct dir_entry_t *pentry) {
-
-    if (!pdir || !pdir->entry || !pentry) {
-        errno = EFAULT;
+    if (!pdir || !pentry)
         return -1;
-    }
 
-    if (pdir->current_dir_entry == pdir->amount) return 1;
+    struct root_entry_t *entry = NULL;
 
-    for (; pdir->current_dir_entry < pdir->amount; pdir->current_dir_entry++) {
-        if ((pdir->entry[pdir->current_dir_entry].attributes & VOLUME_LABEL) ||
-            (pdir->entry[pdir->current_dir_entry].filename[0] == DELETED)) {
+    while (1) {
+        entry = &pdir->entry[pdir->size++];
+
+        if (entry->file_name[0] == 0) {
+            entry = NULL;
+            break;
+        }
+
+        if (entry->file_name[0] == '\xE5')
             continue;
-        } else break;
+
+        if (!(entry->file_attributes & (DIRECTORY | VOLUME_LABEL)) ||
+            (entry->file_attributes & DIRECTORY) && !(entry->file_attributes & VOLUME_LABEL))
+            break;
+
     }
 
-    pentry->size = (pdir->entry + pdir->current_dir_entry)->file_size;
-    parse_filename(pdir->entry + pdir->current_dir_entry, pentry->name);
-    pentry->is_readonly = ((pdir->entry + pdir->current_dir_entry)->attributes & READ_ONLY) != 0;
-    pentry->is_archived = ((pdir->entry + pdir->current_dir_entry)->attributes & ARCHIVE) != 0;
-    pentry->is_directory = ((pdir->entry + pdir->current_dir_entry)->attributes & DIRECTORY) != 0;
-    pentry->is_hidden = ((pdir->entry + pdir->current_dir_entry)->attributes & HIDDEN_FILE) != 0;
-    pentry->is_system = ((pdir->entry + pdir->current_dir_entry)->attributes & SYSTEM_FILE) != 0;
-    pdir->current_dir_entry++;
+    if (!entry)
+        return 1;
+
+    pentry->name = filename_join(entry->file_name);
+    if (!pentry->name)
+        return -1;
+
+    pentry->size = entry->file_size;
+    pentry->is_archived = entry->file_attributes & ARCHIVE;
+    pentry->is_readonly = entry->file_attributes & READ_ONLY;
+    pentry->is_system = entry->file_attributes & SYSTEM_FILE;
+    pentry->is_hidden = entry->file_attributes & HIDDEN_FILE;
+    pentry->is_directory = entry->file_attributes & DIRECTORY;
+
+    free(pentry->name); // ?
+
     return 0;
 }
 
-
 int dir_close(struct dir_t *pdir) {
-    if (!pdir) {
-        errno = EFAULT;
+    if (!pdir)
         return -1;
-    }
+
+    free(pdir);
+
     return 0;
+}
+
+uint8_t check_fat_super(struct fat_super_t super) {
+    uint8_t errors = 0;
+
+    // Check magic number
+    if (super.magic != 43605)
+        errors |= ERROR_MAGIC;
+
+    // Check number of reserved sectors
+    if (super.reserved_sectors < 1)
+        errors |= ERROR_RESERVED_SECTORS;
+
+    // Check number of FATs
+    if (super.fat_count < 1)
+        errors |= ERROR_FAT_COUNT;
+
+    // Check bytes per sector and root directory capacity
+    if (super.bytes_per_sector == 0 ||
+        (super.root_dir_capacity * sizeof(struct root_entry_t) % super.bytes_per_sector) != 0)
+        errors |= ERROR_BYTES_PER_SECTOR;
+
+    // Check number of logical sectors
+    if (super.logical_sectors16 == 0 && super.logical_sectors32 == 0)
+        errors |= ERROR_LOGICAL_SECTORS;
+
+    // Check number of sectors per FAT
+    if (super.sectors_per_fat < 1)
+        errors |= ERROR_SECTORS_PER_FAT;
+
+    // Check if logical sectors value is correct
+    if (super.logical_sectors16 == 0 && super.logical_sectors32 <= 65535)
+        errors |= ERROR_LOGICAL_SECTORS_VALUE;
+
+    // Check if sectors per cluster is power of two
+    if (!(super.sectors_per_cluster & (super.sectors_per_cluster - 1)) == 0)
+        errors |= ERROR_SECTORS_PER_CLUSTER;
+
+    return errors;
+}
+
+lba_t get_fat1_pos(struct volume_t *volume) {
+    return volume->start_pos + volume->fat_super.reserved_sectors;
+}
+
+lba_t get_fat2_pos(struct volume_t *volume) {
+    return volume->fat1_start + volume->fat_super.sectors_per_fat;
+}
+
+lba_t get_root_dir_pos(struct volume_t *volume) {
+    return volume->fat2_start + volume->fat_super.sectors_per_fat;
+}
+
+lba_t get_cluster2_pos(struct volume_t *volume) {
+    return volume->root_dir_start + volume->root_dir_size;
+}
+
+uint32_t get_volume_size(struct volume_t *volume) {
+    return volume->fat_super.logical_sectors16 == 0 ? volume->fat_super.logical_sectors32
+                                                    : volume->fat_super.logical_sectors16;
+}
+
+uint32_t get_user_space(struct volume_t *volume) {
+    return volume->volume_size - volume->fat_super.reserved_sectors -
+           volume->fat_super.fat_count * volume->fat_super.sectors_per_fat - volume->root_dir_size;
+}
+
+uint32_t get_total_clusters(struct volume_t *volume) {
+    return volume->user_space_size / volume->fat_super.sectors_per_cluster;
+}
+
+uint32_t get_root_dir_size(struct volume_t *volume) {
+    uint32_t size =
+            (volume->fat_super.root_dir_capacity * sizeof(struct root_entry_t)) / volume->fat_super.bytes_per_sector;
+    if (((volume->fat_super.root_dir_capacity * sizeof(struct root_entry_t)) % volume->fat_super.bytes_per_sector) != 0)
+        size += 1;
+    return size;
+}
+
+int set_volume_geometry(struct volume_t *volume, uint32_t first_sector) {
+
+    volume->start_pos = first_sector;
+    volume->fat1_start = get_fat1_pos(volume);
+    volume->fat2_start = get_fat2_pos(volume);
+    volume->root_dir_start = get_root_dir_pos(volume);
+
+    volume->root_dir_size = get_root_dir_size(volume);
+
+    volume->cluster2_start = get_cluster2_pos(volume);
+
+    volume->volume_size = get_volume_size(volume);
+    volume->user_space_size = get_user_space(volume);
+
+    volume->total_clusters = get_total_clusters(volume);
+    volume->bytes_per_sector = volume->fat_super.bytes_per_sector;
+
+    if (volume->total_clusters == 0)
+        return -1;
+
+    return 0;
+}
+
+int compare_fat_tables(const struct volume_t *volume) {
+    void *fat1_table = calloc(volume->fat_super.sectors_per_fat, volume->bytes_per_sector);
+    void *fat2_table = calloc(volume->fat_super.sectors_per_fat, volume->bytes_per_sector);
+
+    if (!fat1_table || !fat2_table)
+        return -1;
+
+    if (disk_read(volume->disk, volume->fat1_start, fat1_table, volume->fat_super.sectors_per_fat) !=
+        volume->fat_super.sectors_per_fat ||
+        disk_read(volume->disk, volume->fat2_start, fat2_table, volume->fat_super.sectors_per_fat) !=
+        volume->fat_super.sectors_per_fat) {
+        return free(fat1_table), free(fat2_table), -1;
+    }
+
+    int comparison_result = memcmp(fat1_table, fat2_table,
+                                   volume->fat_super.sectors_per_fat * volume->bytes_per_sector);
+    free(fat1_table);
+    free(fat2_table);
+    return comparison_result != 0 ? 1 : 0;
+}
+
+uint32_t *load_fat_table(const struct volume_t *volume) {
+    uint8_t *fat1_table = calloc(volume->fat_super.sectors_per_fat, volume->bytes_per_sector);
+    if (!fat1_table)
+        return NULL;
+
+    if (disk_read(volume->disk, volume->fat1_start, fat1_table, volume->fat_super.sectors_per_fat) !=
+        volume->fat_super.sectors_per_fat)
+        return free(fat1_table), NULL;
+
+    uint32_t *fat_data = (uint32_t *) calloc(sizeof(uint32_t), volume->total_clusters);
+    if (!fat_data)
+        return free(fat1_table), NULL;
+
+    for (cluster_t i = 0; i < volume->total_clusters * 3 / 2; i += 3) {
+        fat_data[i / 3 * 2 + 0] = ((uint32_t) (fat1_table[i + 1] & 0x0F) << 8) | fat1_table[i + 0];
+        fat_data[i / 3 * 2 + 1] = ((uint32_t) fat1_table[i + 2] << 4) | ((fat1_table[i + 1] & 0xF0) >> 4);
+    }
+
+    return free(fat1_table), fat_data;
+}
+
+struct root_entry_t *find_entry_in_root_dir(const struct volume_t *volume, const char *name) {
+
+    struct root_entry_t *result = NULL;
+
+    for (int i = 0; i < volume->fat_super.root_dir_capacity; ++i) {
+        if (name[0] == '\\') {
+            if (strlen(name) < 2) {
+                result = volume->root_dir;
+                break;
+            }
+            uint8_t entry_name_buffer[FILENAME_SIZE_ROOT + EXTENSION_SIZE_ROOT];
+
+            memset(entry_name_buffer, ' ', FILENAME_SIZE_ROOT + EXTENSION_SIZE_ROOT);
+            memcpy(entry_name_buffer, name + 1, strlen(name) - 1);
+
+            if (memcmp(volume->root_dir[i].file_name, entry_name_buffer, FILENAME_SIZE_ROOT) == 0) {
+                result = &volume->root_dir[i];
+                break;
+            }
+        } else {
+            uint8_t extension_buffer[EXTENSION_SIZE_ROOT];
+            uint8_t name_buffer[FILENAME_SIZE_ROOT];
+
+            memset(extension_buffer, ' ', EXTENSION_SIZE_ROOT);
+            memset(name_buffer, ' ', FILENAME_SIZE_ROOT);
+
+            filename_divide(name, name_buffer, extension_buffer);
+            if (memcmp(volume->root_dir[i].file_name, name_buffer, FILENAME_SIZE_ROOT) == 0 &&
+                memcmp(volume->root_dir[i].file_name + FILENAME_SIZE_ROOT, extension_buffer, EXTENSION_SIZE_ROOT) ==
+                0) {
+                result = &volume->root_dir[i];
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+int filename_divide(const char *filename, uint8_t *name, uint8_t *extension) {
+    if (!filename || !name)
+        return 1;
+
+    if (!extension)
+        return 2;
+
+    char *dot_index = strchr(filename, '.');
+    if (dot_index) {
+        size_t len = dot_index - filename;
+        memcpy(name, filename, len);
+        memcpy(extension, dot_index + 1, strlen(dot_index + 1));
+    } else {
+        memcpy(name, filename, strlen(filename));
+    }
+
+    return 0;
+}
+
+char *filename_join(const char *name)
+{
+    char *buffer = NULL;
+    size_t buffer_size = FILENAME_SIZE_ROOT + EXTENSION_SIZE_ROOT + 2;
+
+    buffer = (char *) malloc(buffer_size * sizeof(char));
+    if (!buffer)
+        return NULL;
+
+    memset(buffer, '\0', buffer_size);
+
+    size_t i = 0, j = 0;
+    for (; i < FILENAME_SIZE_ROOT; ++i)
+        if (name[i] != ' ')
+            buffer[j++] = name[i];
+
+    size_t dot_index = j++;
+    buffer[dot_index] = '.';
+
+    bool extension = false;
+    for (; i < FILENAME_SIZE_ROOT + EXTENSION_SIZE_ROOT; ++i) {
+        if (name[i] != ' ') {
+            extension = true;
+            buffer[j++] = name[i];
+        }
+    }
+
+    if (extension == false)
+        buffer[dot_index] = '\0';
+
+    return buffer;
 }

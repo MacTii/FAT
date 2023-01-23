@@ -1,4 +1,4 @@
-#
+﻿#
 # DANTE :: System Automatycznych Testów Jednostkowych oraz Akceptacyjnych
 # Tomasz Jaworski, 2018-2020
 #
@@ -48,8 +48,7 @@ add_executable(FAT
         "main.c"
         "unit_helper_v2.c"
         "unit_test_v2.c"
-        "rdebug.c"
-        )
+        "rdebug.c")
 
 # Dołącz niezbędne biblioteki
 target_link_libraries(FAT
